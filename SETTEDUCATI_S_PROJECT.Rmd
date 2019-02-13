@@ -1,0 +1,734 @@
+---
+title: "SETTEDUCATI_S_PROJECT"
+output: html_notebook
+---
+
+Import libraries
+```{r}
+library(RSQLite)
+library(Amelia)
+library(caTools)
+library(stringr)
+library(class)
+```
+
+Sets to my working directory
+```{r}
+setwd("/Users/stevensetteducatijr/Google Drive/Schoolwork/Spring 2018/DS 4100/Project/Steam_Vs_G2A")
+```
+
+Set up GetMode method I have been using all semester to find the mode of the vector
+```{r}
+# Calculates the mode of a vector
+# Code source https://www.tutorialspoint.com/r/r_mean_median_mode.htm
+# Args: vect
+# Vect is a vector of any class and content
+GetMode <- function(vect) {
+  # Finds the options in the vector to count
+  uniqueValues <- unique(vect)
+  # Finds the max of each unique value in the vector and returns it
+  return(uniqueValues[which.max(tabulate(match(vect, uniqueValues)))])
+}
+```
+
+Connect to database and sample responses from the steam_scrape table
+```{r}
+conn <- dbConnect(RSQLite::SQLite(),"g2a_vs_steam.db")
+results <- dbSendQuery(conn, "SELECT appid_name.G2AMeanPrice, steam_scrape.AppID, OriginalPrice, DiscountedPrice, ReleaseDate, MetacriticScore, IsGame, Developer, Publisher, Genre, IsWindows, IsMac, IsLinux, Categories FROM [steam_scrape] JOIN appid_name ON [steam_scrape].AppID = appid_name.AppID")
+steam_scrape <- dbFetch(results)
+print(steam_scrape)
+```
+
+Exploratory plots for Missing Values
+
+We are missing some values so lets see a missmap to get a visual sense of it
+```{r}
+missmap(steam_scrape)
+```
+So all of the rows know whether they are games or not (which is good) and all AppID's are there since that was the key lookup used so that also is reassuring. G2AMeanPrice was the initial criterea for the steam scrape so that missing no values is also great. All platforms are there as well as the publisher which is unexpected but welcome. Interestingly enough the developer is not always there which can be strange. Further, some games do not have genre's or categories which seems strange per a marketing strategy. Some games do not have release dates which mean that they are unreleased or only have a general date (such as 2018 as opposed to January 1st 2018), as a result we are probably better off dropping those few rows. Unfortunately, many metacritic scores are unavailable so we will probably have to drop that column. Finally, there are a number of games that do not have prices and since we are trying to predict price we will need to drop those entries entirely.
+
+
+Remove MetacriticScore column and select where prices and release date are not na and then lets check out the missmap
+```{r}
+steam_clean <- steam_scrape[!is.na(steam_scrape$DiscountedPrice) & !is.na(steam_scrape$OriginalPrice) & !is.na(steam_scrape$ReleaseDate),c("DiscountedPrice", "OriginalPrice", "ReleaseDate", "Categories", "Genre", "Developer", "IsLinux", "IsMac", "IsWindows", "Publisher", "IsGame", "AppID", "G2AMeanPrice")]
+missmap(steam_clean)
+```
+So now we can see that there are a few missing values for developer and for Genre and Categories. For developer I know from experience that many publishers are also the developers so a missing developer likely means that the publisher is the same so we can use the case's publisher value for that. Per Genre,I know that most publishing studios generally make the same genre of game and specialize in it, so for that we are going to use the mode of genre of the given studio.
+
+Puts missing Developers as its Publisher
+```{r}
+steam_clean$Developer[is.na(steam_clean$Developer)] <- steam_clean$Publisher[is.na(steam_clean$Developer)]
+```
+
+Setting Genre to its publisher's mode Genre
+
+1. Create a function that can be sapply-ied per line
+```{r}
+# ApplyModePublish - Applies the mode to a publisher's genre when it is missing, optimized for sapply
+# Args: Entry (String) - each row in the vector of Genres we are iterating through via sapply
+#       DF (Dataframe) - The dataframe that contains publisher and genre information
+#       Publisher (String) - The publisher of the row
+ApplyModePublish <- function(entry, df, publisher) {
+  if (is.na(entry)) {
+    return(GetMode(df[df$Publisher == publisher, "Genre"]))
+  } else {
+    return(entry)
+  }
+}
+```
+
+2. Set Na Genre to its Publisher's mode Genre
+```{r}
+steam_clean$Genre <- sapply(X=steam_clean$Genre, FUN=ApplyModePublish, df=steam_clean, publisher=steam_clean$Publisher)
+# Verify that there are no Na values left
+any(is.na(steam_clean$Genre))
+```
+
+Lets re-check the missmap to verify that the previous methods worked
+```{r}
+missmap(steam_clean)
+```
+So now we are only missing some categories, now Categories are a combination of strings which contains various fields such as "Multiplayer", "Valve cheat protection protected", etc. and they can have as many or as few (obviously via the missing cases) as required, for these values I believe the best strategy is to impute the value as a String that does not imply any categories that exist.
+
+Set categories that are missing as an empty string
+```{r}
+steam_clean$Categories[is.na(steam_clean$Categories)] <- ""
+```
+
+Lets check the missmap one more time to verify that we are good
+```{r}
+missmap(steam_clean)
+```
+G2AMeanPrice and AppID being first is a sign that we are all good since they were the first two selected!
+
+Finally, the fields that are categorical are seperated by commas. These will either need to be transformed or turned into dummy variables.
+
+
+Publisher and Developer
+Since there are so many different values that they can have it would be unreasonable to turn each of them into their own column and instead I will rely on my knowledge of the industry that games with multiple publishers/developers often do not work well because of the misshaps of going back and forth between studios and porting code. Further, this may also be a sign that the game was passed off from one to another which means that the game has gone through multiple iterations of ideas and the end product likely suffered as a result. Therefore the plan here is to count the number of Publishers/Developers the project had and save that instead. A field with no commas means there is only one so we will add 1 to that result.
+```{r}
+print(paste("Number of Unique Publishers:", length(unique(steam_clean$Publisher))))
+steam_clean["NumberPublishers"] <- str_count(steam_clean$Publisher, ",") + 1
+```
+
+```{r}
+print(paste("Number of Unique Developers:", length(unique(steam_clean$Developer))))
+steam_clean["NumberDevelopers"] <- str_count(steam_clean$Developer, ",") + 1
+```
+
+This function splits a dataframe's field into multiple fields with that name which are filled with values determining whether or not that field appears in the original vector
+```{r}
+# Splits a vector of strings separated by some splitting string to columns with dummy variables determining if each row has that string in the vector
+# Args:   col_name <- (string)    name of the column in the dataframe for selecting the vector
+#         df       <- (dataframe) dataframe that we are looking to add the new columns to
+#         splitter <- (string)    value we will be seperating the vector of strings on
+# Return: The dataframe with the newly added fields
+string_to_dummy_columns <- function(col_name, df, splitter) {
+  cols <- c()
+  for(mat in str_split(df[, col_name], splitter)) {
+    for(str in mat) {
+      if(!is.na(str) && str != ""){
+        cols <- append(cols, str) 
+      }
+    }
+  }
+  cols <- cols[!duplicated(cols)]
+  for(col in cols) {
+    df[col] <- as.integer(grepl(pattern=col,x=df[, col_name], fixed=T))
+  }
+  return(df)
+}
+```
+
+Genre is a much more limited field so we can split those into dummy fields using the function above
+```{r}
+print(paste("Number of Unique Unedited Genres:", length(unique(steam_clean$Genre))))
+steam_clean <- string_to_dummy_columns("Genre", steam_clean, ",")
+colnames(steam_clean)
+```
+
+Check that they are properly filled
+```{r}
+sum(steam_clean[,16:44])
+```
+This is not the same as the number of rows total which is good because some rows can have no categories and some rows can have multiple categories so this is good.
+
+Lets see if Categories is as limited as genre
+```{r}
+print(paste("Number of Unique Unedited Categories:", length(unique(steam_clean$Categories))))
+```
+Although this is larger than genre we should still try to split them up, we dont have to keep them if there are too many
+```{r}
+steam_clean <- string_to_dummy_columns("Categories", steam_clean, ",")
+colnames(steam_clean)
+```
+
+Lets verify that these values are also filled 
+```{r}
+sum(steam_clean[,45:73])
+```
+Great! Now we have dummy fields for all variables.
+
+
+Exploratory plots for fields' values
+
+Exploring continuous fields
+For continuous fields I will be using the bell curve histogram used in assignment 13.
+
+Histogram creation function for continuous variables
+```{r}
+# Uses guide suggested on assignment page: https://www.statmethods.net/graphs/density.html
+# Add a Normal Curve (Thanks to Peter Dalgaard)
+# Base code provided by above link, application to function done by me
+
+# Creates a histogram with an overlayed bell curve for exploration purposes
+make.hist <- function(vect, x.lab, main.name, seq.length) {
+  x <- vect
+  h<-hist(x, col="red", xlab=x.lab, 
+  	main=main.name) 
+  xfit<-seq(min(x),max(x),length=seq.length) 
+  yfit<-dnorm(xfit,mean=mean(x),sd=sd(x)) 
+  yfit <- yfit*diff(h$mids[1:2])*length(x) 
+  lines(xfit, yfit, col="blue", lwd=2)
+}
+```
+
+Histogram for G2AMeanPrice
+```{r}
+make.hist(steam_clean$G2AMeanPrice, "G2A Mean Price", "Histogram of G2A Mean Price Distributions", 50)
+```
+ So this data is heavily skewed implying that although we have a few high value g2a prices we are mostly looking in the 0-25 range
+
+Histogram for OriginalPrice (on steam)
+```{r}
+make.hist(steam_clean$OriginalPrice, "Steam Original Price", "Histogram of Steam Original Price Distributions", 50)
+```
+This also is very skewed showing that we only have a few prices greater than 50, hopefully once we remove these values we will see a more usefull histogram
+
+
+Histogram of DiscountedPrice (on Steam)
+```{r}
+make.hist(steam_clean$DiscountedPrice, "Steam Discounted Price", "Histogram of Steam Discounted Price Distributions", 50)
+
+```
+As expected, this follows the Original Price since in many cases the discounted price is the same as the original price since many items do not have a discount
+
+
+Lets find out just how many discounted prices are the same as the original price
+```{r}
+same.price <- sum(as.integer(steam_clean$DiscountedPrice == steam_clean$OriginalPrice))
+percent.same <- same.price / nrow(steam_clean)
+print(paste("Number same price:", same.price))
+print(paste("Percent same price:", percent.same))
+```
+Since there are more than 96% same price for discounted price we are better off just removing this column to avoid overfitting.
+
+
+Find out which number discounted price is as well as categories, developer, genre, and publisher
+```{r}
+colnames(steam_clean)
+```
+
+Remove discounted price, categories, genre, publisher, and developer columns
+```{r}
+steam_clean_no_discount <- steam_clean[, c(2:3,7:9,11:73)]
+colnames(steam_clean_no_discount)
+```
+
+
+Detecting Outliers
+
+Since all fields but G2AMeanPrice and OriginalPrice are the only continous variables they are the only ones we need to detect outliers for as all of the others are categorical, boolean, or a key. We will be setting the cutoff at an absolute z-score value of 3 so anything greater is considered an outlier. 
+
+I will be using my z-score functions from assignment 13 to calculate z-scores.
+
+Z-score function to find how far away each of the values are
+```{r}
+# Args: curr - the current value that we are normalizing
+#       standiv - the standard deviation of the vector
+#       mean.val - the mean of the vector
+z_score <- function(curr, standiv, mean.val, abs.val) {
+  score <- ((curr - mean.val) / standiv)
+  if(abs.val) {
+    score <- abs(score)
+  }
+  return(score)
+}
+```
+
+Function to return all the z-scores in the vector
+```{r}
+# Args: Vector - A numerical vector to be standardized
+# Standardizes an entire vector to retrieve their z_score
+z_score.normalize <- function(vector, abs.val) {
+  std <- sd(vector)
+  mn <- mean(vector)
+  rtn <- sapply(vector, z_score, standiv = std, mean.val = mn, abs.val=abs.val)
+  # Returns the zscores of the vector
+  return(rtn)
+}
+```
+
+Perform z_score analysis on G2AMeanPrice
+```{r}
+steam_clean_no_discount["G2AMeanZ"] <- z_score.normalize(steam_clean_no_discount$G2AMeanPrice, T)
+print(paste("Number of outliers:",sum(as.integer(steam_clean_no_discount$G2AMeanZ > 3))))
+```
+since there are only 33 outliers it wouldn't be too bad to remove them from our dataset so we should do that
+
+Perform z_score analysis on OriginalPrice
+```{r}
+steam_clean_no_discount["OriginalZ"] <- z_score.normalize(steam_clean_no_discount$OriginalPrice, T)
+print(paste("Number of outliers:",sum(as.integer(steam_clean_no_discount$OriginalZ > 3))))
+```
+Since there are only 25 outliers we should definitely remove them from the dataset as well.
+
+
+Create new dataframe with outliers removed as well as the absolute zscores removed so if we make a model with all fields these values are not taken into account
+
+Find out column numbers of zscore columns
+```{r}
+colnames(steam_clean_no_discount)
+```
+
+```{r}
+steam.no.outliers <- steam_clean_no_discount[steam_clean_no_discount$OriginalZ < 3 & steam_clean_no_discount$G2AMeanZ < 3, 1:68]
+```
+
+Histograms, again.
+Since the outliers have now been removed lets check out the histogram to determine if they look more normal now
+
+OriginalPrice Histogram
+```{r}
+make.hist(steam.no.outliers$OriginalPrice, "Steam Original Price", "Histogram of Steam Original Price Distributions", 50)
+```
+The values are still a bit left skewed but that is fair because there are valid games in the $40 range that have just been release and there are tons of indie developed games that are very cheap (less than $10)
+
+Histogram of G2AMeanPrice
+```{r}
+make.hist(steam.no.outliers$G2AMeanPrice, "G2A Mean Price", "Histogram of G2A Mean Price Distributions", 50)
+```
+This is still left justified but these values all make sense given that G2A should be cheaper than Steam as a key reseller.
+
+Correlation of G2AMeanPrice and OriginalPrice
+Since there are only two continous variable we can run a correlation analysis on the two
+```{r}
+print(paste("pearson:", cor(x=steam.no.outliers$OriginalPrice, y=steam.no.outliers$G2AMeanPrice)))
+print(paste("spearman:", cor(x=steam.no.outliers$OriginalPrice, y=steam.no.outliers$G2AMeanPrice, method="spearman")))
+
+```
+So the correlation is much less than I had hoped when I started this assignment so this is a bit dissappointing. However, I still believe that the correlation is high enough to justify their inclusion in the model and let the p value determine if they are worth including. Further, since G2A is a key reseller it makes sense that the correlation should be low since their business model is to be cheaper than the original price.
+
+
+Although we already have the day that the game was released we can also determine the days since the game was released (as of 4/18/18) as a continuous variable that may be more relevant
+```{r}
+steam.no.outliers["DaysSinceRelease"] <- as.integer(as.Date("4/18/18", "%m/%d/%y") - as.Date(steam.no.outliers$ReleaseDate))
+head(steam.no.outliers$DaysSinceRelease)
+```
+
+Splitting data into training and validation subsets.
+
+Lets figure out the indexes of the fields we need to keep
+```{r}
+colnames(steam.no.outliers)
+```
+
+We are not going to keep the ReleaseDate column because it is categorical and would not help us build the model
+```{r}
+# Sets seed for reproducability purposes
+set.seed(72)
+
+# Sets up values where the sample is true and where it is false
+steam.no.outliers["Sample"] <- sample.split(steam.no.outliers$OriginalPrice, SplitRatio = .7)
+
+steam.training <- steam.no.outliers[steam.no.outliers$Sample==TRUE, c(1,3:70)]
+steam.testing <- steam.no.outliers[steam.no.outliers$Sample==FALSE, c(1,3:70)]
+
+# Verifying the split
+print(paste("Training number of rows:", nrow(steam.training)))
+print(paste("Testing number of rows:", nrow(steam.testing)))
+print(paste("Percent training:", nrow(steam.training)/nrow(steam.no.outliers)))
+print(paste("Percent testing:", nrow(steam.testing)/nrow(steam.no.outliers)))
+```
+
+Multiple Linear Regression model
+
+Lets start with all fields then work backwards. Note that we have removed the ReleaseDate variable since it is categorical and would break the model building.
+```{r}
+all.fields <- lm(formula = `OriginalPrice` ~ ., data=steam.training)
+summary(all.fields)
+```
+Although it is pretty clear as to which values are important we are going to step through and find the ideal formula
+```{r}
+step(all.fields, data=steam.training, direction="backward")
+```
+```{r}
+ideal.lm <- lm(formula = OriginalPrice ~ IsMac + IsGame + AppID + G2AMeanPrice + 
+    NumberDevelopers + Indie + RPG + Simulation + Casual + `Software Training` + 
+    `Web Publishing` + `Massively Multiplayer` + `Free to Play` + 
+    `Multi-player` + `Valve Anti-Cheat enabled` + `Steam Achievements` + 
+    `Steam Trading Cards` + `Steam Cloud` + `Includes Source SDK` + 
+    `Commentary available` + `Full controller support` + `Steam Leaderboards` + 
+    `Steam Workshop` + `Shared/Split Screen` + `Local Multi-Player` + 
+    `Downloadable Content` + `VR Support` + `Native Steam Controller Support` + 
+    DaysSinceRelease, data = steam.training)
+summary(ideal.lm)
+```
+So all of the variables included are (unsiprisingly) significant.  G2AMeanPrice is the most significant variable since it has the lowest Pr(>|t|) value. The Adjusted R-squared is pretty low however implying that this is not a great model but can likely be used at some point for a little bit of value.
+
+Determining the validity of the model via the testing dataset
+```{r}
+plot(x=predict.lm(object=ideal.lm, newdata=steam.testing), y=steam.testing$OriginalPrice)
+
+```
+As seen above, the data seems quite scattered and so this model is not that great but there seems to be more relevance and reliability in the 3-15 dollar range.
+
+```{r}
+accuracies <- steam.testing$OriginalPrice - predict.lm(object=ideal.lm, newdata=steam.testing, type="response")
+mad(accuracies)
+```
+The mean absolute deviation is pretty high which makes sense based on the previous inputs on whether or not the model is good.
+
+Logistic Regression Model
+
+Since we are predicting a continuous variable we cannot use logistic regression to find an estimated value, we can use it to determine a category of price. For this example we will be splitting the OriginalPrice into two buckets: low and high. The LowPrice bucket will be defined as 0 and will be if the OriginalPrice is less than the mean of all prices. The HighPrice bucket will be defined as 1 and will be if the OriginalPrice is greater than the mean of all prices
+
+Making PriceBucket field
+```{r}
+steam.testing["PriceBucket"] <- steam.testing$OriginalPrice > mean(steam.no.outliers$OriginalPrice)
+steam.training["PriceBucket"] <- steam.training$OriginalPrice > mean(steam.no.outliers$OriginalPrice)
+```
+
+Now that we have the buckets lets make a glm model
+```{r}
+glm.bucket.all <- glm(formula = `PriceBucket` ~ IsLinux + IsMac + IsWindows + IsGame +
+    G2AMeanPrice + NumberPublishers + NumberDevelopers + Action + 
+    Adventure + Indie + Strategy + RPG + Simulation + Racing + 
+    Casual + Nudity + Violent + Sports + Gore + `Sexual Content` + 
+    `Early Access` + `Animation & Modeling` + `Design & Illustration` + 
+    Education + `Software Training` + Utilities + `Web Publishing` + 
+    `Massively Multiplayer` + Movie + `Video Production` + `Free to Play` + 
+    `Audio Production` + Documentary + Short + `360 Video` + 
+    `Photo Editing` + `Multi-player` + `Valve Anti-Cheat enabled` + 
+    `Single-player` + `Steam Achievements` + `Steam Trading Cards` + 
+    `Captions available` + `Partial Controller Support` + `Steam Cloud` + 
+    `Includes Source SDK` + `Cross-Platform Multiplayer` + Stats + 
+    `Commentary available` + `Includes level editor` + `Co-op` + 
+    `Full controller support` + `Steam Leaderboards` + `Steam Workshop` + 
+    `In-App Purchases` + `Shared/Split Screen` + `Online Multi-Player` + 
+    `Local Co-op` + `Local Multi-Player` + `Downloadable Content` + 
+    `VR Support` + `Online Co-op` + MMO + `SteamVR Collectibles` + 
+    `Native Steam Controller Support` + `Steam Turn Notifications` + 
+    DaysSinceRelease, data=steam.training)
+summary(glm.bucket.all)
+```
+Although it is clear which variables are significant, lets make a model based on r's decision of what is and is not significant
+
+Now step through the model to find what r thinks is the ideal one.
+```{r}
+step(glm.bucket.all)
+```
+
+
+Lets make the ideal logistic regression model now
+```{r}
+glm.bucket.ideal <- glm(formula = PriceBucket ~ IsMac + IsGame + AppID + G2AMeanPrice + 
+    NumberDevelopers + Adventure + Indie + Simulation + Casual + 
+    `Web Publishing` + `Massively Multiplayer` + `Multi-player` + 
+    `Steam Cloud` + `Includes Source SDK` + `Cross-Platform Multiplayer` + 
+    `Commentary available` + `Full controller support` + `Steam Workshop` + 
+    `Downloadable Content` + MMO + `Native Steam Controller Support` + 
+    DaysSinceRelease, data = steam.training)
+summary(glm.bucket.ideal)
+```
+
+Now that we have the ideal model lets test it against the testing set
+```{r}
+# predict values
+test.ideal.glm.intermediary <- predict(glm.bucket.ideal, newdata = steam.testing, type='response')
+# Set cutoff
+test.ideal.glm.results <- ifelse(test.ideal.glm.intermediary > .5, 1, 0)
+ideal.glm.pct.not.accurate <- mean(test.ideal.glm.results != steam.testing$PriceBucket)
+print(paste("Accuracy:", (1-ideal.glm.pct.not.accurate)*100, "%"))
+```
+
+For my curiousity I wonder what would happen if we removed any variables with a significance of .1 or higher so lets make another logistic model
+```{r}
+glm.bucket.significant <- glm(formula = PriceBucket ~ IsMac + IsGame + AppID + G2AMeanPrice + Adventure + Indie + Simulation + Casual + `Web Publishing` + `Massively Multiplayer` + `Multi-player` + `Steam Cloud` + `Cross-Platform Multiplayer` + `Full controller support` + `Steam Workshop` + `Downloadable Content` + `Native Steam Controller Support` + DaysSinceRelease, data = steam.training)
+summary(glm.bucket.significant)
+```
+
+Now lets test this against our testing set
+```{r}
+# predict values
+test.significant.glm.intermediary <- predict(glm.bucket.significant, newdata = steam.testing, type='response')
+# Set cutoff
+test.significant.glm.results <- ifelse(test.significant.glm.intermediary > .5, 1, 0)
+significant.glm.pct.not.accurate <- mean(test.significant.glm.results != steam.testing$PriceBucket)
+print(paste("Accuracy:", (1-significant.glm.pct.not.accurate)*100, "%"))
+```
+This improves the accuracy slightly with the only potential cost being overfitting, but still a very good job!
+
+Knn classification
+
+Lets try classifying the bucket again based on Knn but first we need to min max normalize the continuous variables
+
+Min-Max calculation function to be used later for calculations
+```{r}
+# Arguments: Mini (int) - represents the minimum value in the vector
+#            Maxi (int) - represents the maximum number in the vector
+#            Curr (int) - the value currently being normalized
+# This function performs min max normalization on an input
+min_max <- function(curr, mini, maxi) {
+  return((curr - mini)/(maxi - mini))
+}
+```
+
+Min-Max normalization function to be used for the whole vector
+```{r}
+# Arguments: Vector (numerical vector) - represents the vector to be normalized
+# This function normalizes a vector using min_max normalization and returns a vector of the result of these normalizations
+min_max_normalize <- function(vector) {
+  minVal <- min(vector)
+  maxVal <- max(vector)
+  rtn <- sapply(vector, min_max, mini = minVal, maxi = maxVal)
+  return(rtn)
+}
+```
+
+Lets make a dataframe that we can min_max normalize the continous variables
+```{r}
+normalized.testing <- steam.testing[,c(2:5, 7:68,70)]
+normalized.training <- steam.training[,c(2:5, 7:68,70)]
+
+normalized.testing$G2AMeanPrice <- min_max_normalize(normalized.testing$G2AMeanPrice)
+normalized.testing$DaysSinceRelease <- min_max_normalize(normalized.testing$DaysSinceRelease)
+normalized.testing$NumberDevelopers <- min_max_normalize(normalized.testing$NumberDevelopers)
+normalized.testing$NumberPublishers <- min_max_normalize(normalized.testing$NumberPublishers)
+
+normalized.training$G2AMeanPrice <- min_max_normalize(normalized.training$G2AMeanPrice)
+normalized.training$DaysSinceRelease <- min_max_normalize(normalized.training$DaysSinceRelease)
+normalized.training$NumberDevelopers <- min_max_normalize(normalized.training$NumberDevelopers)
+normalized.training$NumberPublishers <- min_max_normalize(normalized.training$NumberPublishers)
+
+head(normalized.training)
+```
+
+Next lets find the number of nearest neighbors by using sqrt(n)
+```{r}
+print(length(colnames(normalized.training)))
+```
+
+Since there are 68 fields and one of them is the value we are looking for (PriceBucket), we will do sqrt(67)
+
+```{r}
+sqrt(67)
+```
+Since this is an even number and PriceBucket is binary we need to do 9 instead
+
+Determine what column number the PriceBucket is
+```{r}
+colnames(normalized.training)
+```
+Now that we know its the last one we can make our knn model
+```{r}
+knn.nine.results <- knn(normalized.training[,c(1:67)], normalized.testing[,c(1:67)], normalized.training$PriceBucket, 9)
+correct.knn.nine <- as.integer(knn.nine.results == normalized.testing$PriceBucket)
+knn.nine.accuracy <- sum(correct.knn.nine) / length(correct.knn.nine)
+print(paste("Accuracy of KNN at 9:", knn.nine.accuracy))
+```
+So this is a great accuracy although I am slightly worried about overfitting. Lets try 7 in case we rounded down
+```{r}
+knn.seven.results <- knn(normalized.training[,c(1:67)], normalized.testing[,c(1:67)], normalized.training$PriceBucket, 7)
+correct.knn.seven <- as.integer(knn.seven.results == normalized.testing$PriceBucket)
+knn.seven.accuracy <- sum(correct.knn.seven) / length(correct.knn.seven)
+print(paste("Accuracy of KNN at 7:", knn.seven.accuracy))
+```
+This is not as good as 9 so lets try 5
+```{r}
+knn.five.results <- knn(normalized.training[,c(1:67)], normalized.testing[,c(1:67)], normalized.training$PriceBucket, 5)
+correct.knn.five <- as.integer(knn.five.results == normalized.testing$PriceBucket)
+knn.five.accuracy <- sum(correct.knn.five) / length(correct.knn.five)
+print(paste("Accuracy of KNN at 5:", knn.five.accuracy))
+```
+This is even better than 7!
+
+Lets try 3 just for fun
+```{r}
+knn.three.results <- knn(normalized.training[,c(1:67)], normalized.testing[,c(1:67)], normalized.training$PriceBucket, 3)
+correct.knn.three <- as.integer(knn.three.results == normalized.testing$PriceBucket)
+knn.three.accuracy <- sum(correct.knn.three) / length(correct.knn.three)
+print(paste("Accuracy of KNN at 3:", knn.three.accuracy))
+```
+Not as good as 5 so 5 it is!
+
+
+
+Overall the accuracy of the knn model at 7 is 96.73% which is much better than the significant logistic regression model at 81.02%
+
+
+ANN (Artificial Neural Network)
+
+First lets import the neural net package
+```{r}
+library(neuralnet)
+```
+
+Since our data is already standardized we can simply reuse this data to build our model
+```{r}
+nn <- neuralnet(formula=`PriceBucket` ~ IsLinux + IsMac + IsWindows + IsGame +
+    G2AMeanPrice + NumberPublishers + NumberDevelopers + Action + 
+    Adventure + Indie + Strategy + RPG + Simulation + Racing + 
+    Casual + Nudity + Violent + Sports + Gore + `Sexual Content` + 
+    `Early Access` + `Animation & Modeling` + `Design & Illustration` + 
+    Education + `Software Training` + Utilities + `Web Publishing` + 
+    `Massively Multiplayer` + Movie + `Video Production` + `Free to Play` + 
+    `Audio Production` + Documentary + Short + `360 Video` + 
+    `Photo Editing` + `Multi-player` + `Valve Anti-Cheat enabled` + 
+    `Single-player` + `Steam Achievements` + `Steam Trading Cards` + 
+    `Captions available` + `Partial Controller Support` + `Steam Cloud` + 
+    `Includes Source SDK` + `Cross-Platform Multiplayer` + Stats + 
+    `Commentary available` + `Includes level editor` + `Co-op` + 
+    `Full controller support` + `Steam Leaderboards` + `Steam Workshop` + 
+    `In-App Purchases` + `Shared/Split Screen` + `Online Multi-Player` + 
+    `Local Co-op` + `Local Multi-Player` + `Downloadable Content` + 
+    `VR Support` + `Online Co-op` + MMO + `SteamVR Collectibles` + 
+    `Native Steam Controller Support` + `Steam Turn Notifications` + 
+    DaysSinceRelease, data=normalized.training, act.fct = "logistic", linear.output = F, lifesign = "minimal")
+plot(nn)
+```
+The output does look a bit odd since we have only one output we are looking for but lets try it
+
+```{r}
+nn.predictions <- compute(nn, normalized.training[, 1:66])
+nn.results <- as.integer(nn.predictions$net.result > .5)
+mean(normalized.training$PriceBucket == nn.results)
+```
+(Originally 82.79% but varies slightly) Accuracy, not bad but lets see if we can do better by adding some hidden nodes
+
+```{r}
+nn.hid <- neuralnet(formula=`PriceBucket` ~ IsLinux + IsMac + IsWindows + IsGame +
+    G2AMeanPrice + NumberPublishers + NumberDevelopers + Action + 
+    Adventure + Indie + Strategy + RPG + Simulation + Racing + 
+    Casual + Nudity + Violent + Sports + Gore + `Sexual Content` + 
+    `Early Access` + `Animation & Modeling` + `Design & Illustration` + 
+    Education + `Software Training` + Utilities + `Web Publishing` + 
+    `Massively Multiplayer` + Movie + `Video Production` + `Free to Play` + 
+    `Audio Production` + Documentary + Short + `360 Video` + 
+    `Photo Editing` + `Multi-player` + `Valve Anti-Cheat enabled` + 
+    `Single-player` + `Steam Achievements` + `Steam Trading Cards` + 
+    `Captions available` + `Partial Controller Support` + `Steam Cloud` + 
+    `Includes Source SDK` + `Cross-Platform Multiplayer` + Stats + 
+    `Commentary available` + `Includes level editor` + `Co-op` + 
+    `Full controller support` + `Steam Leaderboards` + `Steam Workshop` + 
+    `In-App Purchases` + `Shared/Split Screen` + `Online Multi-Player` + 
+    `Local Co-op` + `Local Multi-Player` + `Downloadable Content` + 
+    `VR Support` + `Online Co-op` + MMO + `SteamVR Collectibles` + 
+    `Native Steam Controller Support` + `Steam Turn Notifications` + 
+    DaysSinceRelease, data=normalized.training, hidden=c(20, 10, 5), act.fct = "logistic", linear.output = F, lifesign = "minimal")
+plot(nn.hid)
+```
+Now this looks more like a real neural network, lets see if this increased our accuracy
+
+```{r}
+nn.predictions.hid <- compute(nn.hid, normalized.training[, 1:66])
+nn.results.hid <- as.integer(nn.predictions.hid$net.result > .5)
+mean(normalized.training$PriceBucket == nn.results.hid)
+```
+(Originally, 98.98% but varies slightly) Now thats what I like to see, maybe this is overfitting or maybe its actually using the network correctly but this is really good.
+
+In comparison to our knn (96.73%) and logistic regression (81.02%) this is definitely the best model we have built yet.
+
+
+Now lets try the SVM (support vector machine) model using this guide I found online: http://dataaspirant.com/2017/01/19/support-vector-machine-classifier-implementation-r-caret-package/.
+
+First lets import the library
+```{r}
+library(caret)
+```
+
+First we make a controller for the "computational nuances" of svm the we make a model using the parameters found on the guide
+```{r}
+trctrl <- trainControl(method="repeatedcv", number=10, repeats=3)
+```
+
+Next we need the variable we are looking for (PriceBucket) to be a factor type
+```{r}
+svm.train <- normalized.training
+svm.test <- normalized.testing
+svm.train$PriceBucket <- factor(svm.train$PriceBucket)
+svm.test$PriceBucket <- factor(svm.test$PriceBucket)
+```
+
+Finally lets make the model
+```{r}
+svm.linear <- train(form=`PriceBucket` ~ IsLinux + IsMac + IsWindows + IsGame +
+    G2AMeanPrice + NumberPublishers + NumberDevelopers + Action + 
+    Adventure + Indie + Strategy + RPG + Simulation + Racing + 
+    Casual + Nudity + Violent + Sports + Gore + `Sexual Content` + 
+    `Early Access` + `Animation & Modeling` + `Design & Illustration` + 
+    Education + `Software Training` + Utilities + `Web Publishing` + 
+    `Massively Multiplayer` + Movie + `Video Production` + `Free to Play` + 
+    `Audio Production` + Documentary + Short + `360 Video` + 
+    `Photo Editing` + `Multi-player` + `Valve Anti-Cheat enabled` + 
+    `Single-player` + `Steam Achievements` + `Steam Trading Cards` + 
+    `Captions available` + `Partial Controller Support` + `Steam Cloud` + 
+    `Includes Source SDK` + `Cross-Platform Multiplayer` + Stats + 
+    `Commentary available` + `Includes level editor` + `Co-op` + 
+    `Full controller support` + `Steam Leaderboards` + `Steam Workshop` + 
+    `In-App Purchases` + `Shared/Split Screen` + `Online Multi-Player` + 
+    `Local Co-op` + `Local Multi-Player` + `Downloadable Content` + 
+    `VR Support` + `Online Co-op` + MMO + `SteamVR Collectibles` + 
+    `Native Steam Controller Support` + `Steam Turn Notifications` + 
+    DaysSinceRelease, data=svm.train, method="svmLinear", trControl = trctrl, tuneLength=10)
+svm.linear
+```
+
+Now lets test it against our testing values
+```{r}
+svm.predictions <- predict(svm.linear, newdata = svm.test)
+mean(svm.predictions == svm.test$PriceBucket)
+```
+82.04% Is ok, not as good as the neural network so lets try this again with a non linear model. We had great luck with the neural network so lets try that.
+
+Import brnn
+```{r}
+library(elmNN)
+```
+
+Make the model
+```{r}
+svm.nn <- train(form=`PriceBucket` ~ IsLinux + IsMac + IsWindows + IsGame +
+    G2AMeanPrice + NumberPublishers + NumberDevelopers + Action + 
+    Adventure + Indie + Strategy + RPG + Simulation + Racing + 
+    Casual + Nudity + Violent + Sports + Gore + `Sexual Content` + 
+    `Early Access` + `Animation & Modeling` + `Design & Illustration` + 
+    Education + `Software Training` + Utilities + `Web Publishing` + 
+    `Massively Multiplayer` + Movie + `Video Production` + `Free to Play` + 
+    `Audio Production` + Documentary + Short + `360 Video` + 
+    `Photo Editing` + `Multi-player` + `Valve Anti-Cheat enabled` + 
+    `Single-player` + `Steam Achievements` + `Steam Trading Cards` + 
+    `Captions available` + `Partial Controller Support` + `Steam Cloud` + 
+    `Includes Source SDK` + `Cross-Platform Multiplayer` + Stats + 
+    `Commentary available` + `Includes level editor` + `Co-op` + 
+    `Full controller support` + `Steam Leaderboards` + `Steam Workshop` + 
+    `In-App Purchases` + `Shared/Split Screen` + `Online Multi-Player` + 
+    `Local Co-op` + `Local Multi-Player` + `Downloadable Content` + 
+    `VR Support` + `Online Co-op` + MMO + `SteamVR Collectibles` + 
+    `Native Steam Controller Support` + `Steam Turn Notifications` + 
+    DaysSinceRelease, data=svm.train, method="elm", trControl = trctrl, tuneLength=10)
+```
+
+Now lets check our predictions and accuracy
+```{r}
+svm.predictions.nn <- predict(svm.nn, newdata=svm.test)
+mean(svm.predictions.nn == svm.test$PriceBucket)
+```
+Ouch, this is not as good so we will keep our previous linear model and roll with it.
+
+
+Overall the rankings for best model are:
+1. ANN (nn.hidden) - 98.98%
+2. KNN (knn.five.results) - 96.73
+3. SVM (svm.linear) - 82.04%
+4. GLM (glm.bucket.significant) - 81.02%
